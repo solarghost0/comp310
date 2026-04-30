@@ -1,148 +1,139 @@
 #include "page.h"
-#include <stdint.h>
-#include <stddef.h> 
+#include <stddef.h>
 
-extern char _end;
-// Change these numbers if you dare, bad things will happen. Buffer might be changable but really no point
-#define PAGE_SIZE (4 * 1024)
-#define NUM_PAGES 65536
-#define MEMORY_START 0x00200000
+#define NUM_PAGES     128
+#define PAGE_SIZE     (2 * 1024 * 1024) 
+#define MEM_BASE_ADDR 0x0
 
-// Global page directory and page table - must be 4096-byte aligned and global
-struct page_directory_entry pd[1024] __attribute__((aligned(4096)));
-struct page pt[1024] __attribute__((aligned(4096)));
-
+/* Static array of all physical page descriptors */
 struct ppage physical_page_array[NUM_PAGES];
 
-static struct ppage *free_physical_pages_head = NULL;
+/* Head of the global free list */
+static struct ppage *free_list = NULL;
+
+
+/* Linked list helpers
+ * All allocator functions must go through these — never manipulate
+ * next/prev pointers directly outside of here. */
+
+/*
+ * list_insert
+ *
+ * Prepends node onto the list pointed to by *head.
+ *
+ *  Before:  head → [A] ↔ [B] ↔ [C]
+ *  After:   head → [node] ↔ [A] ↔ [B] ↔ [C]
+ */
+void list_insert(struct ppage **head, struct ppage *node) {
+    if (node == NULL) return;
+
+    node->next = *head;
+    node->prev = NULL;
+
+    if (*head != NULL) {
+        (*head)->prev = node;
+    }
+
+    *head = node;
+}
+
+/*
+ * list_unlink
+ *
+ * Removes node from wherever it sits in the list pointed to by *head.
+ * Repairs the prev/next pointers of its neighbours.
+ *
+ *  Before:  head → [A] ↔ [node] ↔ [B]
+ *  After:   head → [A] ↔ [B]        node→next/prev = NULL
+ */
+void list_unlink(struct ppage **head, struct ppage *node) {
+    if (node == NULL) return;
+
+    if (node->prev != NULL) {
+        node->prev->next = node->next;  /* wire left neighbour past node */
+    } else {
+        *head = node->next;             /* node was the head — update head */
+    }
+
+    if (node->next != NULL) {
+        node->next->prev = node->prev;  /* wire right neighbour past node */
+    }
+
+    /* Leave node clean so it can be safely inserted elsewhere */
+    node->next = NULL;
+    node->prev = NULL;
+}
+
+
+/* Page frame allocator */
+
+/*
+ * init_pfa_list
+ *
+ * Walks physical_page_array, assigns each entry its physical address,
+ * and inserts it into the free list via list_insert.
+ *
+ * We insert in reverse order so that page 0 ends up at the head.
+ */
 void init_pfa_list(void) {
-	for (int i = 0; i < NUM_PAGES; i++) {
-		physical_page_array[i].physical_addr = (void *)(MEMORY_START + (i * PAGE_SIZE));
-		if (i < NUM_PAGES - 1) {
-		    physical_page_array[i].next = &physical_page_array[i + 1];
-		} else {
-		    physical_page_array[i].next = NULL;
-		}
+    free_list = NULL;
 
-		if (i > 0) {
-		    physical_page_array[i].prev = &physical_page_array[i - 1];
-		} else {
-		    physical_page_array[i].prev = NULL;
-		}
-	}
-	free_physical_pages_head = &physical_page_array[0];
+    for (int i = NUM_PAGES - 1; i >= 0; i--) {
+        physical_page_array[i].physical_addr =
+            (void *)(MEM_BASE_ADDR + (unsigned long)i * PAGE_SIZE);
+        physical_page_array[i].next = NULL;
+        physical_page_array[i].prev = NULL;
+
+        list_insert(&free_list, &physical_page_array[i]);
+    }
 }
 
+
+/*
+ * allocate_physical_pages
+ *
+ * Unlinks npages pages from the front of free_list one at a time and
+ * builds a new separate list (allocd_list) from them using list_insert.
+ *
+ * Returns a pointer to allocd_list, or NULL if not enough pages exist.
+ *
+ *  free_list before (npages = 2):
+ *    head → [p0] ↔ [p1] ↔ [p2] ↔ [p3] ↔ ...
+ *
+ *  free_list after:
+ *    head → [p2] ↔ [p3] ↔ ...
+ *
+ *  allocd_list returned:
+ *    head → [p1] ↔ [p0]   (prepend order — caller should not rely on order)
+ */
 struct ppage *allocate_physical_pages(unsigned int npages) {
-    if (npages == 0 || free_physical_pages_head == NULL) {
-        return NULL;
-    }
-    
-    struct ppage *current = free_physical_pages_head;
+    /* Verify enough pages are available before touching anything */
     unsigned int count = 0;
-    
-    while (current != NULL && count < npages) {
-        current = current->next;
+    struct ppage *check = free_list;
+    while (check != NULL && count < npages) {
         count++;
+        check = check->next;
     }
-    
     if (count < npages) {
-        return NULL;
-    }
-    
-    struct ppage *allocated_list = free_physical_pages_head;
-    struct ppage *last_allocated = free_physical_pages_head;
-    
-    for (unsigned int i = 1; i < npages; i++) {
-        last_allocated = last_allocated->next;
+        return NULL;  /* not enough free pages — free list is untouched */
     }
 
-    free_physical_pages_head = last_allocated->next;
+    /* Pull pages off free_list and build allocd_list */
+    struct ppage *allocd_list = NULL;
 
-    if (free_physical_pages_head != NULL) {
-        free_physical_pages_head->prev = NULL;
+    for (unsigned int i = 0; i < npages; i++) {
+        struct ppage *page = free_list;        /* take from head of free list */
+        list_unlink(&free_list, page);         /* remove from free list      */
+        list_insert(&allocd_list, page);       /* prepend onto allocd list   */
     }
-    
-    last_allocated->next = NULL;
-    
-    return allocated_list;
+
+    return allocd_list;
 }
-
 
 void free_physical_pages(struct ppage *ppage_list) {
-    if (ppage_list == NULL) {
-        return;
+    while (ppage_list != NULL) {
+        struct ppage *page = ppage_list;       /* take from head of input list */
+        list_unlink(&ppage_list, page);        /* remove from input list       */
+        list_insert(&free_list, page);         /* return to free list          */
     }
-
-    struct ppage *last = ppage_list;
-    while (last->next != NULL) {
-        last = last->next;
-    }
-    
-    last->next = free_physical_pages_head;
-    
-    if (free_physical_pages_head != NULL) {
-        free_physical_pages_head->prev = last;
-    }
-    
-    ppage_list->prev = NULL;
-    free_physical_pages_head = ppage_list;
-}
-
-// Maps physical pages to virtual address using 2-level page tables
-void *map_pages(void *vaddr, struct ppage *pglist, struct page_directory_entry *pd) {
-    if (vaddr == NULL || pglist == NULL || pd == NULL) {
-        return NULL;
-    }
-    
-    uint32_t addr = (uint32_t)vaddr;
-    uint32_t pd_index = (addr >> 22) & 0x3FF;  // Bits 22-31
-    uint32_t pt_index = (addr >> 12) & 0x3FF;  // Bits 12-21
-    
-    // Init page table if needed
-    if (pd[pd_index].present == 0) {
-        pd[pd_index].present = 1;
-        pd[pd_index].rw = 1;
-        pd[pd_index].user = 0;
-        pd[pd_index].writethru = 0;
-        pd[pd_index].cachedisabled = 0;
-        pd[pd_index].accessed = 0;
-        pd[pd_index].pagesize = 0;
-        pd[pd_index].ignored = 0;
-        pd[pd_index].os_specific = 0;
-        
-        uint32_t pt_phys_addr = (uint32_t)(&pt[0]);
-        pd[pd_index].frame = pt_phys_addr >> 12;
-    }
-    
-    // Map each physical page
-    struct ppage *current = pglist;
-    uint32_t current_pt_index = pt_index;
-    
-    while (current != NULL) {
-        if (current_pt_index >= 1024) {
-            return NULL;
-        }
-        
-        uint32_t phys_addr = (uint32_t)current->physical_addr;
-        
-        pt[current_pt_index].present = 1;
-        pt[current_pt_index].rw = 1;
-        pt[current_pt_index].user = 0;
-        pt[current_pt_index].accessed = 0;
-        pt[current_pt_index].dirty = 0;
-        pt[current_pt_index].unused = 0;
-        pt[current_pt_index].frame = phys_addr >> 12;
-        
-        current = current->next;
-        current_pt_index++;
-    }
-    
-    return vaddr;
-}
-
-// Load page directory into CR3
-void loadPageDirectory(struct page_directory_entry *pd) {
-    uint32_t pd_addr = (uint32_t)pd;
-    asm("mov %0, %%cr3" : : "r"(pd_addr) : );
 }

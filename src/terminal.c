@@ -1,169 +1,78 @@
-#include <stdint.h>
-#include <stdarg.h>
+/* terminal.c — VGA text-mode terminal driver */
 
-// Video memory starts at 0xB8000
-#define VIDEO_MEMORY 0xB8000
-#define SCREEN_WIDTH 80
-#define SCREEN_HEIGHT 25
-#define COLOR 0x07  // Gray text on black background
+#define VIDEO_MEM  ((volatile unsigned short *)0xB8000)
+#define VGA_COLS   80
+#define VGA_ROWS   25          /* rows 0-24; scroll when y reaches 25 */
+#define VGA_COLOR  0x07        /* light grey on black */
 
-// Global variables to track cursor position
-int x = 0;
-int y = 0;
+/* Cursor position — next character will land here */
+static int x = 0;
+static int y = 0;
 
-void putc(int data) {
-    unsigned short *vram = (unsigned short*)VIDEO_MEMORY;
-    
-    // Handle newline character
-    if (data == '\n') {
+/* ---------- low-level helpers ---------- */
+
+/* Write one cell directly at (col, row). */
+static void write_cell(int col, int row, char ch)
+{
+    int offset = row * VGA_COLS + col;
+    VIDEO_MEM[offset] = (unsigned short)(VGA_COLOR << 8) | (unsigned char)ch;
+}
+
+/* Scroll all rows up by one, blank the last row. */
+static void scroll(void)
+{
+    int row, col;
+
+    /* Copy row n+1 → row n */
+    for (row = 0; row < VGA_ROWS - 1; row++)
+        for (col = 0; col < VGA_COLS; col++)
+            VIDEO_MEM[row * VGA_COLS + col] =
+                VIDEO_MEM[(row + 1) * VGA_COLS + col];
+
+    /* Blank the last row */
+    for (col = 0; col < VGA_COLS; col++)
+        write_cell(col, VGA_ROWS - 1, ' ');
+
+    /* Keep cursor on the last row */
+    y = VGA_ROWS - 1;
+}
+
+/* ---------- public API ---------- */
+
+void putc(int data)
+{
+    char ch = (char)data;
+
+    if (ch == '\n') {
+        /* Newline: move to the start of the next row */
         x = 0;
         y++;
+    } else if (ch == '\r') {
+        x = 0;
+    } else if (ch == '\b') {
+        /* Backspace: erase previous character if possible */
+        if (x > 0) {
+            x--;
+            write_cell(x, y, ' ');
+        }
     } else {
-        // Calculate the position in video memory
-        int position = y * SCREEN_WIDTH + x;
-        
-        // Write character and color to video memory
-        // Lower byte is ASCII, upper byte is color
-        vram[position] = (COLOR << 8) | (data & 0xFF);
-        
-        // Move to next position
+        write_cell(x, y, ch);
         x++;
-        
-        // Check if we reached end of line
-        if (x >= SCREEN_WIDTH) {
+
+        /* Wrap at the right edge */
+        if (x >= VGA_COLS) {
             x = 0;
             y++;
         }
     }
-    
-    // Check if we need to scroll
-    if (y >= SCREEN_HEIGHT) {
-        // Scroll the screen up
-        for (int row = 0; row < SCREEN_HEIGHT - 1; row++) {
-            for (int col = 0; col < SCREEN_WIDTH; col++) {
-                int src_pos = (row + 1) * SCREEN_WIDTH + col;
-                int dst_pos = row * SCREEN_WIDTH + col;
-                vram[dst_pos] = vram[src_pos];
-            }
-        }
-        
-        // Clear the last row
-        for (int col = 0; col < SCREEN_WIDTH; col++) {
-            int pos = (SCREEN_HEIGHT - 1) * SCREEN_WIDTH + col;
-            vram[pos] = (COLOR << 8) | ' ';
-        }
-        
-        // Move cursor back to last row
-        y = SCREEN_HEIGHT - 1;
-    }
+
+    /* Scroll if we've gone past the bottom */
+    if (y >= VGA_ROWS)
+        scroll();
 }
 
-void puts(const char *str) {
-    while (*str) {
-        putc(*str);
-        str++;
-    }
-}
-
-static void print_uint(unsigned int value, int base, int uppercase) {
-    char buf[32];
-    int i = 0;
-    const char *digits = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
-
-    if (value == 0) {
-        putc('0');
-        return;
-    }
-
-    while (value > 0) {
-        buf[i++] = digits[value % base];
-        value /= base;
-    }
-
-    while (i > 0) {
-        putc(buf[--i]);
-    }
-}
-
-static void print_int(int value) {
-    if (value < 0) {
-        putc('-');
-        print_uint((unsigned int)(-(value + 1)) + 1, 10, 0);
-    } else {
-        print_uint((unsigned int)value, 10, 0);
-    }
-}
-
-int printf(const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-
-    int count = 0;
-    while (*fmt) {
-        if (*fmt == '%') {
-            fmt++;
-            // Handle optional width/precision like %.8s
-            int precision = -1;
-            if (*fmt == '.') {
-                fmt++;
-                precision = 0;
-                while (*fmt >= '0' && *fmt <= '9') {
-                    precision = precision * 10 + (*fmt - '0');
-                    fmt++;
-                }
-            }
-            switch (*fmt) {
-                case 'd': {
-                    int val = va_arg(args, int);
-                    print_int(val);
-                    break;
-                }
-                case 'u': {
-                    unsigned int val = va_arg(args, unsigned int);
-                    print_uint(val, 10, 0);
-                    break;
-                }
-                case 'x': {
-                    unsigned int val = va_arg(args, unsigned int);
-                    print_uint(val, 16, 0);
-                    break;
-                }
-                case 'X': {
-                    unsigned int val = va_arg(args, unsigned int);
-                    print_uint(val, 16, 1);
-                    break;
-                }
-                case 's': {
-                    const char *s = va_arg(args, const char *);
-                    if (s == 0) s = "(null)";
-                    int i = 0;
-                    while (*s && (precision < 0 || i < precision)) {
-                        putc(*s);
-                        s++;
-                        i++;
-                    }
-                    break;
-                }
-                case 'c': {
-                    int c = va_arg(args, int);
-                    putc(c);
-                    break;
-                }
-                case '%':
-                    putc('%');
-                    break;
-                default:
-                    putc('%');
-                    putc(*fmt);
-                    break;
-            }
-        } else {
-            putc(*fmt);
-        }
-        fmt++;
-        count++;
-    }
-
-    va_end(args);
-    return count;
+void puts(const char *str)
+{
+    while (*str)
+        putc(*str++);
 }

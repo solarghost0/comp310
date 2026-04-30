@@ -1,4 +1,6 @@
 
+// im borrowing this main file cause i know it works from our project
+
 #include <stdint.h>
 #include "interrupt.h"
 

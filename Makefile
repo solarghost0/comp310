@@ -1,107 +1,147 @@
-
-UNAME_M := $(shell uname -m)
-
-# Allow override: `make PREFIX=i386-unknown-elf-`
-# (Only auto-detect on aarch64; native x86 builds use system gcc.)
-ifeq ($(UNAME_M),aarch64)
-
-# Known cross-compiler prefixes on popular distros/toolchains:
-#  - Ubuntu/Debian:       i686-linux-gnu-
-#  - Gentoo (crossdev):   i386-unknown-elf-
-#  - Generic ELF:         i686-elf- / i386-elf-
-#  - Some Linux triplets: i386-pc-linux-gnu- / i686-pc-linux-gnu-
-CROSS_CANDIDATES := \
-  i686-linux-gnu- \
-  i386-unknown-elf- \
-  i686-elf- \
-  i386-elf- \
-  i386-pc-linux-gnu- \
-  i686-pc-linux-gnu-
-
-# Only auto-set PREFIX if the user hasn't provided one.
-ifeq ($(origin PREFIX), undefined)
-PREFIX := $(firstword \
-  $(foreach p,$(CROSS_CANDIDATES), \
-    $(if $(shell command -v $(p)gcc >/dev/null 2>&1 && echo yes),$(p))))
-endif
-
-# Friendly failure if nothing was found.
-ifndef PREFIX
-$(error No i386 cross-compiler found on aarch64. \
-Install one (e.g., i686-linux-gnu-gcc or i386-unknown-elf-gcc) \
-or run: make PREFIX=<triplet->)
-endif
-
-BOOTIMG := /usr/local/grub/lib/grub/i386-pc/boot.img
-GRUBLOC := /usr/local/grub/bin/
-
-else
-PREFIX  ?=
-BOOTIMG := /usr/lib/grub/i386-pc/boot.img
-GRUBLOC :=
-endif
-
-
-CC := $(PREFIX)gcc
-LD := $(PREFIX)ld
-OBJDUMP := $(PREFIX)objdump
-OBJCOPY := $(PREFIX)objcopy
-SIZE := $(PREFIX)size
-CONFIGS := -DCONFIG_HEAP_SIZE=4096
-CFLAGS := -ffreestanding -mgeneral-regs-only -mno-mmx -m32 -march=i386 -fno-pie -fno-stack-protector -g3 -Wall 
-
-ODIR = obj
-SDIR = src
-
-OBJS = \
-	kernel_main.o \
-	terminal.o \
-	interrupt.o \
-	page.o \
-	fat.o \
-	sd.o \
-	ide.o \
-	string.o \
-
-# Make sure to keep a blank line here after OBJS list
-
-OBJ = $(patsubst %,$(ODIR)/%,$(OBJS))
-
-$(ODIR)/%.o: $(SDIR)/%.c
-	$(CC) $(CFLAGS) -c -g -o $@ $^
-
-$(ODIR)/%.o: $(SDIR)/%.s
-	nasm -f elf32 -g -o $@ $^ 
-
-
-all: bin rootfs.img
-
-bin: obj $(OBJ)
-	$(LD) -melf_i386  obj/* -Tkernel.ld -o kernel
-	$(SIZE) kernel
-
-obj:
-	mkdir -p obj
-
-rootfs.img:
-	dd if=/dev/zero of=rootfs.img bs=1M count=32
-	$(GRUBLOC)grub-mkimage -p "(hd0,msdos1)/boot" -o grub.img -O i386-pc normal biosdisk multiboot multiboot2 configfile fat exfat part_msdos
-	dd if=$(BOOTIMG) of=rootfs.img conv=notrunc
-	dd if=grub.img of=rootfs.img conv=notrunc bs=512 seek=1 #########
-	echo 'start=2048, type=83, bootable' | sfdisk rootfs.img
-	mkfs.vfat --offset 2048 -F16 rootfs.img
-	mcopy -i rootfs.img@@1M kernel ::/
-	mcopy -i rootfs.img@@1M TEST.TXT ::/
-	mmd -i rootfs.img@@1M boot 
-	mcopy -i rootfs.img@@1M grub.cfg ::/boot
-	@echo " -- BUILD COMPLETED SUCCESSFULLY --"
-
-
-run:
-	qemu-system-i386 -hda rootfs.img
-
-debug:
-	./launch_qemu.sh
-
+# ─────────────────────────────────────────────────────────────
+#  Makefile — bare-metal x86 kernel
+# ─────────────────────────────────────────────────────────────
+ 
+# ── Toolchain ─────────────────────────────────────────────────
+CC      := gcc
+AS      := nasm
+LD      := ld
+QEMU    := qemu-system-i386
+ 
+# ── Targets & Directories ─────────────────────────────────────
+TARGET  := kernel.bin
+ISO     := kernel.iso
+BUILD   := build
+ISODIR  := $(BUILD)/iso/boot/grub
+ 
+# ── Sources ───────────────────────────────────────────────────
+C_SRCS  := kernel_main.c
+ASM_SRCS := boot.s
+ 
+C_OBJS  := $(patsubst %.c,  $(BUILD)/%.o, $(C_SRCS))
+ASM_OBJS := $(patsubst %.s, $(BUILD)/%.o, $(ASM_SRCS))
+OBJS    := $(ASM_OBJS) $(C_OBJS)
+ 
+# ── Flags ─────────────────────────────────────────────────────
+CFLAGS  := -m32 \
+            -std=c99 \
+            -ffreestanding \
+            -fno-builtin \
+            -fno-stack-protector \
+            -fno-pic \
+            -Wall \
+            -Wextra \
+            -O2
+ 
+ASFLAGS := -f elf32
+ 
+LDFLAGS := -m elf_i386 \
+            -T linker.ld \
+            --oformat binary \
+            -nostdlib
+ 
+# ── GRUB config (written on the fly) ──────────────────────────
+define GRUB_CFG
+set timeout=0
+set default=0
+ 
+menuentry "My Kernel" {
+    multiboot /boot/$(TARGET)
+    boot
+}
+endef
+export GRUB_CFG
+ 
+# ══════════════════════════════════════════════════════════════
+#  Default target
+# ══════════════════════════════════════════════════════════════
+.PHONY: all
+all: $(BUILD)/$(TARGET)
+ 
+# ── Link ──────────────────────────────────────────────────────
+$(BUILD)/$(TARGET): $(OBJS) linker.ld | $(BUILD)
+	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+	@echo "[LD]  $@"
+ 
+# ── Compile C ─────────────────────────────────────────────────
+$(BUILD)/%.o: %.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+	@echo "[CC]  $<"
+ 
+# ── Assemble ──────────────────────────────────────────────────
+$(BUILD)/%.o: %.s | $(BUILD)
+	$(AS) $(ASFLAGS) $< -o $@
+	@echo "[AS]  $<"
+ 
+# ── Create build dir ──────────────────────────────────────────
+$(BUILD):
+	mkdir -p $(BUILD)
+ 
+# ══════════════════════════════════════════════════════════════
+#  ISO  (requires grub-mkrescue + xorriso)
+# ══════════════════════════════════════════════════════════════
+.PHONY: iso
+iso: $(BUILD)/$(TARGET)
+	mkdir -p $(ISODIR)
+	cp $(BUILD)/$(TARGET) $(BUILD)/iso/boot/$(TARGET)
+	echo "$$GRUB_CFG" > $(ISODIR)/grub.cfg
+	grub-mkrescue -o $(BUILD)/$(ISO) $(BUILD)/iso
+	@echo "[ISO] $(BUILD)/$(ISO)"
+ 
+# ══════════════════════════════════════════════════════════════
+#  Run in QEMU
+# ══════════════════════════════════════════════════════════════
+.PHONY: run
+run: $(BUILD)/$(TARGET)
+	$(QEMU) -kernel $(BUILD)/$(TARGET)
+ 
+.PHONY: run-iso
+run-iso: iso
+	$(QEMU) -cdrom $(BUILD)/$(ISO)
+ 
+# Run with serial output redirected to stdio (useful for debugging)
+.PHONY: debug
+debug: $(BUILD)/$(TARGET)
+	$(QEMU) -kernel $(BUILD)/$(TARGET) \
+	        -serial stdio \
+	        -d int,cpu_reset \
+	        -no-reboot
+ 
+# ══════════════════════════════════════════════════════════════
+#  Inspect
+# ══════════════════════════════════════════════════════════════
+.PHONY: disasm
+disasm: $(BUILD)/$(TARGET)
+	objdump -m i386 -b binary -D $(BUILD)/$(TARGET) | less
+ 
+.PHONY: nm
+nm: $(BUILD)/$(TARGET)
+	nm -n $(BUILD)/$(TARGET) 2>/dev/null || objdump -t $(BUILD)/$(TARGET)
+ 
+# ══════════════════════════════════════════════════════════════
+#  Clean
+# ══════════════════════════════════════════════════════════════
+.PHONY: clean
 clean:
-	rm -f grub.img kernel rootfs.img obj/*
+	rm -rf $(BUILD)
+	@echo "[CLEAN] done"
+ 
+.PHONY: distclean
+distclean: clean
+	rm -f $(BUILD)/$(ISO)
+ 
+# ══════════════════════════════════════════════════════════════
+#  Help
+# ══════════════════════════════════════════════════════════════
+.PHONY: help
+help:
+	@echo ""
+	@echo "  make            — build kernel.bin"
+	@echo "  make iso        — build bootable ISO (needs grub-mkrescue)"
+	@echo "  make run        — run kernel in QEMU (-kernel)"
+	@echo "  make run-iso    — run ISO in QEMU (-cdrom)"
+	@echo "  make debug      — run with serial + interrupt logging"
+	@echo "  make disasm     — disassemble kernel binary"
+	@echo "  make clean      — remove build artifacts"
+	@echo ""
+ 

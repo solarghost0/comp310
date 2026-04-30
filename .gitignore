@@ -1,0 +1,6 @@
+grub.img
+kernel
+rootfs.img
+obj/*
+*.swp
+*.swo
